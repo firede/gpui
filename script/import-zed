@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+"""Imports the Zed commit a gpui-pre release snapshots, as a new commit on the
+`vendor` branch.
+
+    script/import-zed --zed ~/Store/Repo/zed 0.3.10
+
+gpui-pre is the weekly snapshot of Zed's GPUI on crates.io, which libraries
+depend on. Importing the very commit it was made from keeps this repository's
+API the one those libraries are built against, so an application can replace
+gpui-pre with it through `[patch.crates-io]`.
+
+The commit holds nothing but what Zed has at that commit, taken out of Zed's
+monorepo so that it builds on its own:
+
+- the crates listed as `seeds` in `fork.toml`, and every crate they reach
+  through a path dependency (dev- and build-dependencies included, since
+  Cargo resolves those for every workspace member), unchanged;
+- the files under `assets/` that those crates include by relative path, with
+  the rest of each such directory (font licenses);
+- a root `Cargo.toml` made from Zed's: the workspace dependencies, patches
+  and profile overrides those crates use, Zed's lints and profiles;
+- Zed's `Cargo.lock`, pruned by Cargo to what is still used, so every crate
+  resolves to the version Zed shipped with;
+- `LICENSE-APACHE`, `clippy.toml`, `.cargo/config.toml` and
+  `rust-toolchain.toml`, trimmed of what only the rest of Zed needs;
+- under `compat/`, one stand-in crate per gpui-pre crate, with gpui-pre's
+  package name, version and features, re-exporting the imported crate;
+- `ZED.toml`, recording the gpui-pre version, the Zed commit and the imported
+  crates.
+
+The commit is tagged `upstream/gpui-pre-<version>`. The patch queue on `main`
+is then rebased onto it by hand; see SYNC.md.
+"""
+
+import argparse
+import json
+import os
+import posixpath
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import tomllib
+import urllib.request
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+VENDOR_BRANCH = "vendor"
+CRATES_IO = "https://crates.io/api/v1/crates"
+GPUI_PRE_ROOTS = ["gpui-pre", "gpui-pre-platform", "gpui-pre-macros"]
+DEPENDENCY_TABLES = ("dependencies", "dev-dependencies", "build-dependencies")
+
+# Parts of Zed's `.cargo/config.toml` that only the rest of Zed needs: the
+# xtask alias names a crate that is not imported, and lld on aarch64 Linux is
+# there to link libwebrtc.
+DROPPED_CARGO_CONFIG_SECTIONS = {"target.aarch64-unknown-linux-gnu"}
+DROPPED_CARGO_CONFIG_KEYS = {"alias": {"xtask"}}
+
+
+def run(args, cwd, input=None, env=None):
+    result = subprocess.run(
+        args,
+        cwd=cwd,
+        input=input,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        check=False,
+    )
+    if result.returncode != 0:
+        sys.exit(f"{' '.join(args)} failed in {cwd}:\n{result.stderr.decode(errors='replace')}")
+    return result.stdout
+
+
+def git_text(args, cwd):
+    return run(["git", *args], cwd).decode().strip()
+
+
+def zed_file(zed, commit, path):
+    result = subprocess.run(
+        ["git", "show", f"{commit}:{path}"], cwd=zed, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    return result.stdout.decode() if result.returncode == 0 else None
+
+
+def zed_has(zed, commit, path):
+    return subprocess.run(["git", "cat-file", "-e", f"{commit}:{path}"], cwd=zed, stderr=subprocess.DEVNULL).returncode == 0
+
+
+def extract(zed, commit, paths, worktree):
+    archive = run(["git", "archive", "--format=tar", commit, "--", *paths], zed)
+    run(["tar", "-x", "-f", "-"], worktree, input=archive)
+
+
+def dependency_tables(manifest):
+    for table in DEPENDENCY_TABLES:
+        if table in manifest:
+            yield manifest[table]
+    for target in manifest.get("target", {}).values():
+        for table in DEPENDENCY_TABLES:
+            if table in target:
+                yield target[table]
+
+
+def crate_closure(zed, commit, seeds, workspace_dependencies):
+    """Every crate the seeds reach through path dependencies, and the
+    workspace dependencies those crates name."""
+    crates = {}
+    used_workspace_dependencies = set()
+    queue = list(seeds)
+    while queue:
+        directory = queue.pop()
+        if directory in crates:
+            continue
+        text = zed_file(zed, commit, f"{directory}/Cargo.toml")
+        if text is None:
+            sys.exit(f"{directory}/Cargo.toml does not exist at {commit}")
+        manifest = tomllib.loads(text)
+        crates[directory] = manifest["package"]["name"]
+        for table in dependency_tables(manifest):
+            for name, spec in table.items():
+                if not isinstance(spec, dict):
+                    continue
+                if spec.get("workspace"):
+                    used_workspace_dependencies.add(name)
+                    workspace_spec = workspace_dependencies[name]
+                    if isinstance(workspace_spec, dict) and "path" in workspace_spec:
+                        queue.append(posixpath.normpath(workspace_spec["path"]))
+                elif "path" in spec:
+                    queue.append(posixpath.normpath(posixpath.join(directory, spec["path"])))
+    return crates, used_workspace_dependencies
+
+
+def asset_directories(zed, commit, crate_directories):
+    """The directories under `assets/` holding files the crates include by a
+    relative path such as `../../../assets/fonts/lilex/Lilex-Regular.ttf`."""
+    result = subprocess.run(
+        ["git", "grep", "-h", "-o", "-I", "-E", r"(\.\./)+assets/[A-Za-z0-9_./-]+", commit, "--", *crate_directories],
+        cwd=zed,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode not in (0, 1):
+        sys.exit(f"git grep failed:\n{result.stderr.decode(errors='replace')}")
+    directories = set()
+    for match in result.stdout.decode().split():
+        path = re.sub(r"^(\.\./)+", "", match)
+        if not zed_has(zed, commit, path):
+            sys.exit(f"an imported crate refers to {match}, which Zed does not have at {commit}")
+        directories.add(posixpath.dirname(path))
+    return sorted(directories)
+
+
+def bracket_depth(line):
+    """How much `line` opens TOML arrays and inline tables, ignoring
+    brackets in strings and comments."""
+    depth = 0
+    quote = None
+    escaped = False
+    for character in line:
+        if quote:
+            if escaped:
+                escaped = False
+            elif character == "\\" and quote == '"':
+                escaped = True
+            elif character == quote:
+                quote = None
+        elif character in "\"'":
+            quote = character
+        elif character == "#":
+            break
+        elif character in "[{":
+            depth += 1
+        elif character in "]}":
+            depth -= 1
+    return depth
+
+
+def toml_sections(text):
+    """The sections of a TOML file in order, as (header, leading, lines):
+    `leading` holds the comments right above the header, which belong to it.
+    The lines before the first header have the header None."""
+    sections = [[None, [], []]]
+    for line in text.splitlines():
+        header = re.match(r"^\[([^\[\]]+)\]\s*(#.*)?$", line)
+        if header:
+            previous = sections[-1][2]
+            split = len(previous)
+            while split > 0 and (not previous[split - 1].strip() or previous[split - 1].lstrip().startswith("#")):
+                split -= 1
+            leading = [line for line in previous[split:] if line.strip()]
+            del previous[split:]
+            sections.append([header.group(1).strip(), leading, []])
+        else:
+            sections[-1][2].append(line)
+    return [tuple(section) for section in sections]
+
+
+def toml_entries(lines):
+    """The key/value entries of a section, in order, as (key, text). Comments
+    and blank lines between entries are dropped."""
+    entries = []
+    key = None
+    buffer = []
+    depth = 0
+    for line in lines:
+        if key is None:
+            match = re.match(r'^\s*("[^"]+"|[A-Za-z0-9_.-]+)\s*=', line)
+            if not match:
+                continue
+            key = match.group(1).strip('"')
+            buffer = [line]
+            depth = bracket_depth(line)
+        else:
+            buffer.append(line)
+            depth += bracket_depth(line)
+        if depth == 0:
+            entries.append((key, "\n".join(buffer)))
+            key = None
+    if key is not None:
+        sys.exit(f"unterminated TOML entry {key}")
+    return entries
+
+
+def section_text(header, lines, leading=()):
+    while lines and not lines[-1].strip():
+        lines = lines[:-1]
+    return "\n".join([*leading, f"[{header}]", *lines])
+
+
+def root_manifest(zed_manifest_text, members, used_workspace_dependencies, lock_packages, label, commit):
+    sections = toml_sections(zed_manifest_text)
+    members = sorted(members)
+    parts = [
+        f"# Made by script/import-zed from Zed's Cargo.toml at {commit} ({label}).\n"
+        "# Do not edit by hand: change the script and import again (SYNC.md).",
+        "[workspace]\nresolver = \"2\"\nmembers = [\n"
+        + "".join(f'    "{member}",\n' for member in members)
+        + ']\ndefault-members = ["crates/gpui"]',
+    ]
+    dependencies = []
+    dependency_subtables = []
+    patches = []
+    profiles = []
+    lints = []
+    for header, leading, lines in sections:
+        if header == "workspace.package":
+            parts.append(section_text(header, lines, leading))
+        elif header == "workspace.dependencies":
+            dependencies = [text for key, text in toml_entries(lines) if key in used_workspace_dependencies]
+        elif header and header.startswith("workspace.dependencies."):
+            if header.removeprefix("workspace.dependencies.") in used_workspace_dependencies:
+                dependency_subtables.append(section_text(header, lines, leading))
+        elif header == "patch.crates-io":
+            for key, text in toml_entries(lines):
+                if key not in lock_packages:
+                    continue
+                if re.search(r"\bpath\s*=", text):
+                    sys.exit(f"Zed patches {key} with a local path, which the import does not carry over")
+                patches.append(text)
+        elif header and header.startswith("profile."):
+            if header.endswith(".package"):
+                kept = [text for key, text in toml_entries(lines) if key in lock_packages]
+                if kept:
+                    profiles.append("\n".join([f"[{header}]", *kept]))
+            else:
+                profiles.append(section_text(header, lines, leading))
+        elif header and header.startswith("workspace.lints"):
+            lints.append(section_text(header, lines, leading))
+    parts.append("[workspace.dependencies]\n" + "\n".join(dependencies))
+    parts.extend(dependency_subtables)
+    if patches:
+        parts.append(
+            "# Cargo applies [patch] only from the root of a build: an application\n"
+            "# using this repository copies these into its own Cargo.toml (README.md).\n"
+            "[patch.crates-io]\n" + "\n".join(patches)
+        )
+    parts.extend(profiles)
+    parts.extend(lints)
+    return "\n\n".join(parts) + "\n"
+
+
+def cargo_config(text):
+    kept = []
+    for header, leading, lines in toml_sections(text):
+        if header in DROPPED_CARGO_CONFIG_SECTIONS:
+            continue
+        dropped_keys = DROPPED_CARGO_CONFIG_KEYS.get(header)
+        if dropped_keys:
+            lines = [entry for key, entry in toml_entries(lines) if key not in dropped_keys]
+        if header is None:
+            if any(line.strip() for line in lines):
+                kept.append("\n".join(lines).strip())
+        else:
+            kept.append(section_text(header, lines, leading))
+    return "\n\n".join(kept) + "\n"
+
+
+def rust_toolchain(text):
+    toolchain = tomllib.loads(text)["toolchain"]
+    # Zed's extra targets are for its extensions and remote server.
+    lines = [
+        "# Zed's toolchain at the imported tag, without the targets only the rest of Zed builds for.",
+        "[toolchain]",
+        f'channel = "{toolchain["channel"]}"',
+    ]
+    if "profile" in toolchain:
+        lines.append(f'profile = "{toolchain["profile"]}"')
+    if "components" in toolchain:
+        lines.append("components = [" + ", ".join(f'"{component}"' for component in toolchain["components"]) + "]")
+    return "\n".join(lines) + "\n"
+
+
+def lock_package_names(worktree):
+    with open(os.path.join(worktree, "Cargo.lock"), "rb") as file:
+        lock = tomllib.load(file)
+    return {package["name"] for package in lock.get("package", [])}
+
+
+def resolve(worktree, zed_lock):
+    """Writes Zed's lockfile and lets Cargo prune it to this workspace."""
+    with open(os.path.join(worktree, "Cargo.lock"), "w", encoding="utf-8") as file:
+        file.write(zed_lock)
+    metadata = run(["cargo", "metadata", "--format-version", "1"], worktree)
+    return json.loads(metadata)
+
+
+def write(worktree, path, text):
+    full = os.path.join(worktree, path)
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    with open(full, "w", encoding="utf-8") as file:
+        file.write(text)
+
+
+def check_manifest(manifest_text, zed_manifest, used_workspace_dependencies):
+    """The generated manifest must give every crate exactly Zed's workspace
+    dependencies."""
+    generated = tomllib.loads(manifest_text)["workspace"]["dependencies"]
+    zed_dependencies = zed_manifest["workspace"]["dependencies"]
+    for name in used_workspace_dependencies:
+        if generated.get(name) != zed_dependencies[name]:
+            sys.exit(f"the generated Cargo.toml gives {name} as {generated.get(name)!r}, Zed as {zed_dependencies[name]!r}")
+
+
+def crates_io(path):
+    request = urllib.request.Request(f"{CRATES_IO}/{path}", headers={"User-Agent": "firede-gpui script/import-zed"})
+    with urllib.request.urlopen(request) as response:
+        return json.load(response)
+
+
+def gpui_pre_release(version):
+    """The Zed commit gpui-pre `version` snapshots, as its description names
+    it, and every gpui-pre crate of that release with its features."""
+    description = crates_io(f"gpui-pre/{version}")["version"]["description"] or ""
+    match = re.search(r"zed@([0-9a-f]{7,40})", description)
+    if not match:
+        sys.exit(f"gpui-pre {version}'s description names no Zed commit: {description!r}")
+    family = {}
+    queue = list(GPUI_PRE_ROOTS)
+    while queue:
+        name = queue.pop()
+        if name in family:
+            continue
+        family[name] = sorted(crates_io(f"{name}/{version}")["version"]["features"])
+        dependencies = crates_io(f"{name}/{version}/dependencies")["dependencies"]
+        queue.extend(dependency["crate_id"] for dependency in dependencies if dependency["crate_id"].startswith("gpui-pre"))
+    return match.group(1), family
+
+
+def stand_ins(zed, commit, crates, family, version):
+    """A crate per gpui-pre crate: gpui-pre's name, version and features,
+    re-exporting the crate of this repository it was published from."""
+    by_package = {package: directory for directory, package in crates.items()}
+    files = {}
+    for name, gpui_pre_features in sorted(family.items()):
+        suffix = name.removeprefix("gpui-pre").removeprefix("-").replace("-", "_")
+        candidates = ["gpui"] if not suffix else [suffix, f"gpui_{suffix}"]
+        package = next((candidate for candidate in candidates if candidate in by_package), None)
+        if package is None:
+            sys.exit(f"{name} {version} stands for none of the imported crates ({', '.join(candidates)}); add it to `seeds`")
+        directory = by_package[package]
+        manifest = tomllib.loads(zed_file(zed, commit, f"{directory}/Cargo.toml"))
+        library = manifest.get("lib", {}).get("name", package.replace("-", "_"))
+        features = manifest.get("features", {})
+        missing = [feature for feature in gpui_pre_features if feature not in features]
+        if missing:
+            sys.exit(f"{name} {version} has features {missing} that Zed's {package} doesn't")
+        forwarded = [
+            f'{feature} = ["upstream/{feature}"]'
+            for feature in sorted(features)
+            if feature != "default"
+        ]
+        if "default" in features:
+            forwarded.insert(0, 'default = ["upstream/default"]')
+        stand_in = f"compat/{name}"
+        files[f"{stand_in}/Cargo.toml"] = (
+            f"# Made by script/import-zed: Zed's `{package}` under the name, version and features\n"
+            f"# of gpui-pre's `{name}`, for an application's [patch.crates-io] (README.md).\n"
+            "[package]\n"
+            f'name = "{name}"\n'
+            f'version = "{version}"\n'
+            'license = "Apache-2.0"\n'
+            "edition.workspace = true\n"
+            "publish.workspace = true\n\n"
+            "[lib]\n"
+            f'name = "{library}"\n'
+            'path = "lib.rs"\n'
+            "doctest = false\n\n"
+            "[features]\n" + "".join(f"{line}\n" for line in forwarded) + "\n"
+            "[dependencies]\n"
+            f'upstream = {{ package = "{package}", path = "{posixpath.relpath(directory, stand_in)}", default-features = false }}\n'
+        )
+        files[f"{stand_in}/lib.rs"] = f"//! Zed's `{library}`, standing in for `{name}` {version}; see README.md.\n\npub use upstream::*;\n"
+    return files
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--zed", required=True, help="a clone of Zed with the commit fetched")
+    parser.add_argument("version", help="the gpui-pre release to follow, such as 0.3.10")
+    args = parser.parse_args()
+
+    with open(os.path.join(ROOT, "fork.toml"), "rb") as file:
+        config = tomllib.load(file)
+    zed = os.path.abspath(os.path.expanduser(args.zed))
+    label = f"gpui-pre-{args.version}"
+    vendor_tag = f"upstream/{label}"
+    if subprocess.run(["git", "rev-parse", "--verify", "--quiet", f"refs/tags/{vendor_tag}"], cwd=ROOT, stdout=subprocess.DEVNULL).returncode == 0:
+        sys.exit(f"{vendor_tag} already exists")
+    short_commit, family = gpui_pre_release(args.version)
+    commit = git_text(["rev-parse", "--verify", f"{short_commit}^{{commit}}"], zed)
+
+    zed_manifest_text = zed_file(zed, commit, "Cargo.toml")
+    zed_manifest = tomllib.loads(zed_manifest_text)
+    crates, used_workspace_dependencies = crate_closure(
+        zed, commit, config["seeds"], zed_manifest["workspace"]["dependencies"]
+    )
+    crate_directories = sorted(crates)
+    assets = asset_directories(zed, commit, crate_directories)
+    compat = stand_ins(zed, commit, crates, family, args.version)
+    compat_directories = sorted({posixpath.dirname(path) for path in compat})
+    members = [*crate_directories, *compat_directories]
+    print(
+        f"gpui-pre {args.version} is Zed {commit[:10]}: {len(crates)} crates, "
+        f"{len(compat_directories)} gpui-pre stand-ins, {len(used_workspace_dependencies)} workspace dependencies"
+    )
+
+    has_vendor = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{VENDOR_BRANCH}"], cwd=ROOT, stdout=subprocess.DEVNULL
+    ).returncode == 0
+    temporary = tempfile.mkdtemp(prefix="gpui-import-")
+    worktree = os.path.join(temporary, "vendor")
+    if has_vendor:
+        run(["git", "worktree", "add", "--quiet", worktree, VENDOR_BRANCH], ROOT)
+    else:
+        run(["git", "worktree", "add", "--quiet", "--orphan", "-b", VENDOR_BRANCH, worktree], ROOT)
+    try:
+        # Start from nothing, so whatever Zed dropped is dropped here too.
+        run(["git", "rm", "-r", "-q", "--ignore-unmatch", "."], worktree)
+        for entry in os.listdir(worktree):
+            if entry != ".git":
+                path = os.path.join(worktree, entry)
+                shutil.rmtree(path) if os.path.isdir(path) else os.remove(path)
+
+        extract(zed, commit, [*crate_directories, *assets, "LICENSE-APACHE", "clippy.toml"], worktree)
+        for path, text in compat.items():
+            write(worktree, path, text)
+        write(worktree, ".cargo/config.toml", cargo_config(zed_file(zed, commit, ".cargo/config.toml")))
+        write(worktree, "rust-toolchain.toml", rust_toolchain(zed_file(zed, commit, "rust-toolchain.toml")))
+        write(worktree, ".gitignore", "/target\n")
+        zed_lock = zed_file(zed, commit, "Cargo.lock")
+
+        # Which crates.io packages the workspace uses decides which of Zed's
+        # patches and profile overrides apply, so resolve once without them.
+        write(worktree, "Cargo.toml", root_manifest(zed_manifest_text, members, used_workspace_dependencies, set(), label, commit))
+        resolve(worktree, zed_lock)
+        packages = lock_package_names(worktree)
+        manifest = root_manifest(zed_manifest_text, members, used_workspace_dependencies, packages, label, commit)
+        check_manifest(manifest, zed_manifest, used_workspace_dependencies)
+        write(worktree, "Cargo.toml", manifest)
+        metadata = resolve(worktree, zed_lock)
+        run(["cargo", "metadata", "--format-version", "1", "--locked"], worktree)
+        workspace_members = {package["name"] for package in metadata["packages"] if package["id"] in metadata["workspace_members"]}
+        expected = set(crates.values()) | set(family)
+        if workspace_members != expected:
+            sys.exit(f"Cargo sees members {sorted(workspace_members)}, the import expected {sorted(expected)}")
+
+        write(
+            worktree,
+            "ZED.toml",
+            "# Written by script/import-zed: the gpui-pre release this vendor commit follows,\n"
+            "# and the Zed commit it was made from.\n"
+            f'gpui_pre = "{args.version}"\n'
+            f'repository = "{config["zed_repository"]}"\n'
+            f'commit = "{commit}"\n'
+            "crates = [\n" + "".join(f'    "{directory}",\n' for directory in crate_directories) + "]\n"
+            "assets = [\n" + "".join(f'    "{directory}",\n' for directory in assets) + "]\n"
+            "compat = [\n" + "".join(f'    "{directory}",\n' for directory in compat_directories) + "]\n",
+        )
+
+        run(["git", "add", "-A", "."], worktree)
+        if subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=worktree).returncode == 0:
+            sys.exit(f"nothing changed: {VENDOR_BRANCH} already holds gpui-pre {args.version}'s Zed")
+        repository = config["zed_repository"].removeprefix("https://github.com/")
+        message = f"Import Zed at gpui-pre {args.version}\n\nUpstream-commit: {repository}@{commit}\n"
+        run(["git", "commit", "-q", "-m", message], worktree)
+        run(["git", "tag", vendor_tag], worktree)
+        print(git_text(["show", "--stat", "--format=%h %s", "HEAD"], worktree).splitlines()[-1])
+        print(f"{VENDOR_BRANCH} is at {vendor_tag}; rebase main onto it as SYNC.md describes")
+    finally:
+        run(["git", "worktree", "remove", "--force", worktree], ROOT)
+        shutil.rmtree(temporary, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Lists the patch queue: every commit on main after the infrastructure commit,
+# with the Upstream and Drop-when trailers each patch carries. See SYNC.md.
+
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+base="upstream/gpui-pre-$(sed -n 's/^gpui_pre = "\(.*\)"$/\1/p' ZED.toml)"
+infrastructure=$(git rev-list --reverse "$base..HEAD" | head -n 1)
+if [[ -z "$infrastructure" ]]; then
+    echo "no commits on top of $base" >&2
+    exit 1
+fi
+
+echo "base: $base"
+git log --reverse --format='%n%h %s%n%(trailers:key=Upstream,key=Drop-when)' "$infrastructure..HEAD"

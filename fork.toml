@@ -1,0 +1,7 @@
+# What script/import-zed takes from Zed. See SYNC.md.
+
+zed_repository = "https://github.com/zed-industries/zed"
+
+# The crates the fork is for. Every crate they depend on through a path,
+# including dev- and build-dependencies, is imported with them.
+seeds = ["crates/gpui", "crates/gpui_platform"]
