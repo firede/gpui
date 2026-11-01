@@ -1463,6 +1463,7 @@ impl WaylandConnection {
             return;
         };
         if state.mouse_focused_window.is_some() || state.keyboard_focused_window.is_some() {
+            let extra = crate::linux::wayland::clipboard::extra_mime_types(&item);
             state.clipboard.set(item);
             let Some(serial) = state.serial_tracker.selection_serial() else {
                 log::warn!(
@@ -1476,6 +1477,9 @@ impl WaylandConnection {
                 data_source.offer(mime_type.to_string());
             }
             data_source.offer(state.clipboard.self_mime());
+            for mime_type in extra {
+                data_source.offer(mime_type);
+            }
             data_device.set_selection(Some(&data_source), serial.as_raw());
         }
     }
