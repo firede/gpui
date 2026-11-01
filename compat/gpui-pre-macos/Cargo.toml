@@ -1,0 +1,24 @@
+# Made by script/import-zed: Zed's `gpui_macos` under the name, version and features
+# of gpui-pre's `gpui-pre-macos`, for an application's [patch.crates-io] (README.md).
+[package]
+name = "gpui-pre-macos"
+version = "0.3.10"
+license = "Apache-2.0"
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "gpui_macos"
+path = "lib.rs"
+doctest = false
+
+[features]
+default = ["upstream/default"]
+bench-support = ["upstream/bench-support"]
+font-kit = ["upstream/font-kit"]
+runtime_shaders = ["upstream/runtime_shaders"]
+screen-capture = ["upstream/screen-capture"]
+test-support = ["upstream/test-support"]
+
+[dependencies]
+upstream = { package = "gpui_macos", path = "../../crates/gpui_macos", default-features = false }

@@ -1,0 +1,21 @@
+# Made by script/import-zed: Zed's `ztracing` under the name, version and features
+# of gpui-pre's `gpui-pre-ztracing`, for an application's [patch.crates-io] (README.md).
+[package]
+name = "gpui-pre-ztracing"
+version = "0.3.10"
+license = "Apache-2.0"
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "ztracing"
+path = "lib.rs"
+doctest = false
+
+[features]
+tracing-tracy = ["upstream/tracing-tracy"]
+tracy = ["upstream/tracy"]
+web = ["upstream/web"]
+
+[dependencies]
+upstream = { package = "ztracing", path = "../../crates/ztracing", default-features = false }

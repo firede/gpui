@@ -1,0 +1,28 @@
+# Made by script/import-zed: Zed's `gpui_platform` under the name, version and features
+# of gpui-pre's `gpui-pre-platform`, for an application's [patch.crates-io] (README.md).
+[package]
+name = "gpui-pre-platform"
+version = "0.3.10"
+license = "Apache-2.0"
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "gpui_platform"
+path = "lib.rs"
+doctest = false
+
+[features]
+default = ["upstream/default"]
+bench-support = ["upstream/bench-support"]
+font-kit = ["upstream/font-kit"]
+inspector = ["upstream/inspector"]
+multithreaded = ["upstream/multithreaded"]
+runtime_shaders = ["upstream/runtime_shaders"]
+screen-capture = ["upstream/screen-capture"]
+test-support = ["upstream/test-support"]
+wayland = ["upstream/wayland"]
+x11 = ["upstream/x11"]
+
+[dependencies]
+upstream = { package = "gpui_platform", path = "../../crates/gpui_platform", default-features = false }

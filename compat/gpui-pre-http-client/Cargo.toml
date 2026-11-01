@@ -1,0 +1,20 @@
+# Made by script/import-zed: Zed's `http_client` under the name, version and features
+# of gpui-pre's `gpui-pre-http-client`, for an application's [patch.crates-io] (README.md).
+[package]
+name = "gpui-pre-http-client"
+version = "0.3.10"
+license = "Apache-2.0"
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "http_client"
+path = "lib.rs"
+doctest = false
+
+[features]
+github-download = ["upstream/github-download"]
+test-support = ["upstream/test-support"]
+
+[dependencies]
+upstream = { package = "http_client", path = "../../crates/http_client", default-features = false }

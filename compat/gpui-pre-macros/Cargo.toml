@@ -1,0 +1,19 @@
+# Made by script/import-zed: Zed's `gpui_macros` under the name, version and features
+# of gpui-pre's `gpui-pre-macros`, for an application's [patch.crates-io] (README.md).
+[package]
+name = "gpui-pre-macros"
+version = "0.3.10"
+license = "Apache-2.0"
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "gpui_macros"
+path = "lib.rs"
+doctest = false
+
+[features]
+inspector = ["upstream/inspector"]
+
+[dependencies]
+upstream = { package = "gpui_macros", path = "../../crates/gpui_macros", default-features = false }

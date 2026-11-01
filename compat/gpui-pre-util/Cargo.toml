@@ -1,0 +1,20 @@
+# Made by script/import-zed: Zed's `util` under the name, version and features
+# of gpui-pre's `gpui-pre-util`, for an application's [patch.crates-io] (README.md).
+[package]
+name = "gpui-pre-util"
+version = "0.3.10"
+license = "Apache-2.0"
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "util"
+path = "lib.rs"
+doctest = false
+
+[features]
+debug-embed = ["upstream/debug-embed"]
+test-support = ["upstream/test-support"]
+
+[dependencies]
+upstream = { package = "util", path = "../../crates/util", default-features = false }

@@ -1,0 +1,22 @@
+# Made by script/import-zed: Zed's `gpui_wgpu` under the name, version and features
+# of gpui-pre's `gpui-pre-wgpu`, for an application's [patch.crates-io] (README.md).
+[package]
+name = "gpui-pre-wgpu"
+version = "0.3.10"
+license = "Apache-2.0"
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "gpui_wgpu"
+path = "lib.rs"
+doctest = false
+
+[features]
+default = ["upstream/default"]
+bench-support = ["upstream/bench-support"]
+font-kit = ["upstream/font-kit"]
+test-support = ["upstream/test-support"]
+
+[dependencies]
+upstream = { package = "gpui_wgpu", path = "../../crates/gpui_wgpu", default-features = false }

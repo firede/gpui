@@ -1,0 +1,18 @@
+# Made by script/import-zed: Zed's `gpui_shared_string` under the name, version and features
+# of gpui-pre's `gpui-pre-shared-string`, for an application's [patch.crates-io] (README.md).
+[package]
+name = "gpui-pre-shared-string"
+version = "0.3.10"
+license = "Apache-2.0"
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "gpui_shared_string"
+path = "lib.rs"
+doctest = false
+
+[features]
+
+[dependencies]
+upstream = { package = "gpui_shared_string", path = "../../crates/gpui_shared_string", default-features = false }
